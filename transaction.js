@@ -323,7 +323,7 @@ async function main() {
       console.log(`Raw transaction: ${txData.txHex.substring(0, 100)}...`);
       
       // Ask if user wants to broadcast
-      const broadcast = await getUserInput('\n📡 Broadcast transaction to network? (y/n): ');
+      const broadcast = await getUserInput('\nBroadcast transaction to network? (y/n): ');
       
       if (broadcast.toLowerCase() === 'y' || broadcast.toLowerCase() === 'yes') {
         console.log('\nBroadcasting transaction...');
