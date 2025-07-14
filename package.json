@@ -1,0 +1,26 @@
+{
+  "name": "bitcoin-transaction-generator",
+  "version": "1.0.0",
+  "description": "Bitcoin transaction generator using bitcoinjs-lib and send-crypto",
+  "main": "transaction.js",
+  "scripts": {
+    "start": "node transaction.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "bitcoinjs-lib": "^6.1.5",
+    "ecpair": "^2.1.0",
+    "send-crypto": "^2.6.0"
+  },
+  "keywords": [
+    "bitcoin",
+    "cryptocurrency",
+    "transaction",
+    "blockchain"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0"
+  }
+} 
