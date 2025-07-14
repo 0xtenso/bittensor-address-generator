@@ -8,11 +8,26 @@ const readline = require('readline');
 // Initialize ECPair with secp256k1
 const ECPairAPI = ECPairFactory(ecc);
 
-// Bitcoin testnet network
-const TESTNET = bitcoin.networks.testnet;
+// Network configurations
+const NETWORKS = {
+  mainnet: {
+    network: bitcoin.networks.bitcoin,
+    apiBase: 'https://blockstream.info/api',
+    name: 'Bitcoin Mainnet',
+    faucetUrl: null,
+    wifPrefix: 'mainnet (starts with 5, K, or L)'
+  },
+  testnet: {
+    network: bitcoin.networks.testnet,
+    apiBase: 'https://blockstream.info/testnet/api',
+    name: 'Bitcoin Testnet',
+    faucetUrl: 'https://coinfaucet.eu/en/btc-testnet/',
+    wifPrefix: 'testnet (starts with 9 or c)'
+  }
+};
 
-// Blockstream testnet API
-const API_BASE = 'https://blockstream.info/testnet/api';
+let currentNetwork = null;
+let API_BASE = null;
 
 // Create readline interface for user input
 const rl = readline.createInterface({
@@ -29,17 +44,42 @@ function getUserInput(question) {
   });
 }
 
+// Function to select network
+async function selectNetwork() {
+  console.log('Available networks:');
+  console.log('1. Bitcoin Mainnet');
+  console.log('2. Bitcoin Testnet');
+  
+  const choice = await getUserInput('\nSelect network (1 for mainnet, 2 for testnet): ');
+  
+  if (choice === '1' || choice.toLowerCase() === 'mainnet') {
+    currentNetwork = NETWORKS.mainnet;
+    API_BASE = NETWORKS.mainnet.apiBase;
+    console.log(`Selected: ${NETWORKS.mainnet.name}`);
+    console.log('WARNING: You are using REAL BITCOIN on mainnet!');
+  } else if (choice === '2' || choice.toLowerCase() === 'testnet') {
+    currentNetwork = NETWORKS.testnet;
+    API_BASE = NETWORKS.testnet.apiBase;
+    console.log(`Selected: ${NETWORKS.testnet.name}`);
+    console.log('You are using test Bitcoin - safe for testing');
+  } else {
+    throw new Error('Invalid network selection');
+  }
+  
+  console.log(`Required WIF format: ${currentNetwork.wifPrefix}\n`);
+}
+
 // Function to get address from private key
 function getAddressFromPrivateKey(privateKeyWIF) {
   try {
-    const keyPair = ECPairAPI.fromWIF(privateKeyWIF, TESTNET);
+    const keyPair = ECPairAPI.fromWIF(privateKeyWIF, currentNetwork.network);
     const { address } = bitcoin.payments.p2pkh({ 
       pubkey: keyPair.publicKey, 
-      network: TESTNET 
+      network: currentNetwork.network 
     });
     return { address, keyPair };
   } catch (error) {
-    throw new Error('Invalid private key WIF format');
+    throw new Error(`Invalid private key WIF format for ${currentNetwork.name}`);
   }
 }
 
@@ -75,7 +115,8 @@ async function getFeeRate() {
   try {
     const response = await axios.get(`${API_BASE}/fee-estimates`);
     // Use the fee rate for 6 blocks confirmation (medium priority)
-    return Math.ceil(response.data['6'] || 2); // fallback to 2 sat/vbyte
+    const feeRate = Math.ceil(response.data['6'] || response.data['3'] || 2);
+    return feeRate;
   } catch (error) {
     console.log('Using fallback fee rate: 2 sat/vbyte');
     return 2;
@@ -98,7 +139,7 @@ async function broadcastTransaction(txHex) {
 async function createTransaction(fromKeyPair, toAddress, amountSats, subtractFee = false) {
   const fromAddress = bitcoin.payments.p2pkh({ 
     pubkey: fromKeyPair.publicKey, 
-    network: TESTNET 
+    network: currentNetwork.network 
   }).address;
 
   // Get UTXOs
@@ -109,13 +150,15 @@ async function createTransaction(fromKeyPair, toAddress, amountSats, subtractFee
 
   // Get fee rate
   const feeRate = await getFeeRate();
+  console.log(`Current fee rate: ${feeRate} sat/vbyte`);
   
   // Create transaction builder
-  const psbt = new bitcoin.Psbt({ network: TESTNET });
+  const psbt = new bitcoin.Psbt({ network: currentNetwork.network });
   
   let totalInput = 0;
+  let inputCount = 0;
   
-  // Add inputs
+  // Add inputs (only use what we need)
   for (const utxo of utxos) {
     // Get transaction details for this UTXO
     const txResponse = await axios.get(`${API_BASE}/tx/${utxo.txid}/hex`);
@@ -128,13 +171,15 @@ async function createTransaction(fromKeyPair, toAddress, amountSats, subtractFee
     });
     
     totalInput += utxo.value;
+    inputCount++;
     
-    // Break if we have enough funds
-    if (totalInput >= amountSats + 1000) break; // rough fee estimate
+    // Rough estimate: if we have enough for amount + reasonable fee, break
+    const roughFeeEstimate = (inputCount * 148 + 2 * 34 + 10) * feeRate;
+    if (totalInput >= amountSats + roughFeeEstimate + 1000) break;
   }
 
-  // Estimate transaction size (roughly)
-  const estimatedSize = utxos.length * 148 + 2 * 34 + 10; // inputs + outputs + overhead
+  // More accurate transaction size estimation
+  const estimatedSize = inputCount * 148 + 2 * 34 + 10; // inputs + outputs + overhead
   const estimatedFee = estimatedSize * feeRate;
 
   let actualAmount = amountSats;
@@ -159,7 +204,9 @@ async function createTransaction(fromKeyPair, toAddress, amountSats, subtractFee
 
   // Add change output if needed
   const change = totalInput - actualAmount - estimatedFee;
-  if (change > 546) { // dust threshold
+  const dustThreshold = 546; // Bitcoin dust threshold
+  
+  if (change > dustThreshold) {
     psbt.addOutput({
       address: fromAddress,
       value: change,
@@ -179,41 +226,69 @@ async function createTransaction(fromKeyPair, toAddress, amountSats, subtractFee
     txHex: tx.toHex(),
     txId: tx.getId(),
     size: tx.virtualSize(),
-    fee: estimatedFee
+    fee: estimatedFee,
+    change: change > dustThreshold ? change : 0
   };
+}
+
+// Function to validate Bitcoin address for current network
+function validateAddress(address) {
+  try {
+    bitcoin.address.toOutputScript(address, currentNetwork.network);
+    return true;
+  } catch (error) {
+    return false;
+  }
 }
 
 // Main function
 async function main() {
   try {
-    console.log('=== Bitcoin Testnet Transaction Generator ===\n');
+    console.log('Bitcoin Transaction Generator\n');
+    
+    // Select network first
+    await selectNetwork();
     
     // Get private key from user
-    const privateKeyWIF = await getUserInput('Enter your private key (WIF format for testnet): ');
+    const privateKeyWIF = await getUserInput(`Enter your private key (${currentNetwork.wifPrefix}): `);
     
     // Get address and keypair
     const { address, keyPair } = getAddressFromPrivateKey(privateKeyWIF);
-    console.log(`\nYour testnet address: ${address}`);
+    console.log(`\n Your ${currentNetwork.name} address: ${address}`);
     
     // Get balance
-    console.log('\nFetching balance...');
+    console.log('\n Fetching balance...');
     const balance = await getBalance(address);
+    
+    const btcBalance = balance.total / 100000000;
     console.log(`Confirmed balance: ${balance.confirmed} satoshis (${balance.confirmed / 100000000} BTC)`);
     console.log(`Unconfirmed balance: ${balance.unconfirmed} satoshis`);
-    console.log(`Total balance: ${balance.total} satoshis (${balance.total / 100000000} BTC)`);
+    console.log(`Total balance: ${balance.total} satoshis (${btcBalance} BTC)`);
     
     if (balance.total === 0) {
-      console.log('\n No funds available. Get testnet coins from: https://coinfaucet.eu/en/btc-testnet/');
+      if (currentNetwork.faucetUrl) {
+        console.log(`\nNo funds available. Get test coins from: ${currentNetwork.faucetUrl}`);
+      } else {
+        console.log('\nNo funds available. You need to deposit Bitcoin to this address.');
+      }
       rl.close();
       return;
     }
     
     // Ask if user wants to send a transaction
-    const sendTx = await getUserInput('\nDo you want to send a transaction? (y/n): ');
+    const sendTx = await getUserInput('\n Do you want to send a transaction? (y/n): ');
     
     if (sendTx.toLowerCase() === 'y' || sendTx.toLowerCase() === 'yes') {
       // Get recipient address
-      const toAddress = await getUserInput('Enter recipient testnet address: ');
+      let toAddress;
+      while (true) {
+        toAddress = await getUserInput(`Enter recipient ${currentNetwork.name} address: `);
+        if (validateAddress(toAddress)) {
+          break;
+        } else {
+          console.log(`Invalid address for ${currentNetwork.name}. Please try again.`);
+        }
+      }
       
       // Get amount
       const amountInput = await getUserInput(`Enter amount in satoshis (max: ${balance.total}): `);
@@ -225,6 +300,12 @@ async function main() {
         return;
       }
       
+      if (amountSats > balance.total) {
+        console.log('Amount exceeds available balance');
+        rl.close();
+        return;
+      }
+      
       // Ask about fee handling
       const subtractFeeInput = await getUserInput('Subtract fee from amount? (y/n): ');
       const subtractFee = subtractFeeInput.toLowerCase() === 'y' || subtractFeeInput.toLowerCase() === 'yes';
@@ -232,21 +313,30 @@ async function main() {
       console.log('\nCreating transaction...');
       const txData = await createTransaction(keyPair, toAddress, amountSats, subtractFee);
       
-      console.log(`\nTransaction created:`);
+      console.log(`\nTransaction created successfully:`);
       console.log(`Transaction ID: ${txData.txId}`);
       console.log(`Size: ${txData.size} vbytes`);
-      console.log(`Fee: ${txData.fee} satoshis`);
-      console.log(`Raw transaction: ${txData.txHex}`);
+      console.log(`Fee: ${txData.fee} satoshis (${txData.fee / 100000000} BTC)`);
+      if (txData.change > 0) {
+        console.log(`Change: ${txData.change} satoshis (${txData.change / 100000000} BTC)`);
+      }
+      console.log(`Raw transaction: ${txData.txHex.substring(0, 100)}...`);
       
       // Ask if user wants to broadcast
-      const broadcast = await getUserInput('\nBroadcast transaction to testnet? (y/n): ');
+      const broadcast = await getUserInput('\n📡 Broadcast transaction to network? (y/n): ');
       
       if (broadcast.toLowerCase() === 'y' || broadcast.toLowerCase() === 'yes') {
         console.log('\nBroadcasting transaction...');
         const txId = await broadcastTransaction(txData.txHex);
         console.log(`Transaction broadcast successfully!`);
         console.log(`Transaction ID: ${txId}`);
-        console.log(`View on explorer: https://blockstream.info/testnet/tx/${txId}`);
+        
+        const explorerUrl = currentNetwork.network === bitcoin.networks.bitcoin 
+          ? `https://blockstream.info/tx/${txId}`
+          : `https://blockstream.info/testnet/tx/${txId}`;
+        console.log(`View on explorer: ${explorerUrl}`);
+      } else {
+        console.log('\nTransaction created but not broadcast. You can broadcast the raw transaction manually.');
       }
     }
     
